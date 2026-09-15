@@ -1,0 +1,23 @@
+# 复制本文件为 config.yaml 并填入你自己的值；config.yaml 已被 .gitignore 排除，不会提交到仓库
+
+# YouTube 频道地址
+channel_url: "https://www.youtube.com/@YOUR_CHANNEL"
+
+# 从视频字幕提取密码失败时的兜底密码（可为空字符串）
+fallback_password: "0000"
+
+# 订阅链接识别正则：从解密后的文本中区分 v2ray / Clash 两类订阅直链
+v2ray_link_pattern: "v-youtube(?:%40|@)YOUR_CHANNEL_NAME"
+clash_link_pattern: "c-youtube(?:%40|@)YOUR_CHANNEL_NAME"
+
+# 本地代理地址（访问 YouTube / GitHub raw 必需）
+proxy_url: "http://127.0.0.1:7890"
+
+# v2rayN 配置数据库（SQLite）路径
+v2rayn_db: "E:/<v2rayN 安装目录>/guiConfigs/guiNDB.db"
+
+# mihomo-party (Clash Party) 配置目录
+mihomo_party_dir: "C:/Users/<用户名>/AppData/Roaming/mihomo-party"
+
+# Clash Party 可执行文件路径（用于更新配置后重启）
+clash_party_exe: "D:/<Clash Party 安装目录>/Clash Party.exe"

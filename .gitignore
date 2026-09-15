@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# 本地隐私配置与运行产物，勿提交
+config.yaml
+clash_config.yaml
+youtube_cookies.json
+*.log
+output*.txt
+test_output.txt
+
+# 一次性调试脚本（含本机路径，不入库）
+scripts/
