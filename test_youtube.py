@@ -241,6 +241,42 @@ def get_transcript(video_id):
     return ""
 
 
+def extract_sub_urls_by_position(paste_content):
+    """按位置提取订阅链接：定位含“订阅链接”的行，取其后面最近的一个 URL，
+    再根据该行及前两行上下文里出现的客户端名称判断归属（v2ray 还是 Clash）。
+    地址本身的文件名经常变（v-/c- 前缀、---16v 后缀、%40 编码都出现过），
+    不能按 URL 特征匹配，只认位置。"""
+    lines = paste_content.splitlines()
+    v2ray_url = None
+    clash_url = None
+    for i, line in enumerate(lines):
+        if "订阅链接" not in line:
+            continue
+        # 标签可能和客户端列表同行，也可能换行分开，把前两行一并算作上下文
+        context = "\n".join(lines[max(0, i - 2): i + 1]).lower()
+        url = None
+        # URL 可能和标签同行（“v2ray订阅链接： https://...”），先看“订阅链接”之后的部分
+        m = re.search(r"https?://\S+", line[line.rindex("订阅链接") + len("订阅链接"):])
+        if m:
+            url = m.group(0)
+        else:
+            for j in range(i + 1, min(i + 4, len(lines))):
+                m = re.search(r"https?://\S+", lines[j])
+                if m:
+                    url = m.group(0)
+                    break
+        if not url:
+            continue
+        if clash_url is None and "clash" in context:
+            clash_url = url
+        elif v2ray_url is None and re.search(
+            r"v2ray|小火箭|shadowrocket|quantumult|surge|hiddify|nekobox|karing|surfboard|stash",
+            context,
+        ):
+            v2ray_url = url
+    return v2ray_url, clash_url
+
+
 def extract_password(transcript):
     # strip timestamps that get concatenated with subtitle text
     clean = re.sub(r"\d{1,3}:\d{2}", "", transcript)
@@ -446,17 +482,18 @@ async def main_async():
                 print(f"\n=== Paste 内容 ===")
                 print(paste_content)
 
-                urls = re.findall(r'https?://[^\s\n]+', paste_content)
                 import base64 as _b64
-                clash_url = None
-                v2ray_url = None
-                # 2026-09 起地址改为 GitHub raw 直链，按文件名的 v-/c- 后缀区分
-                for u in urls:
-                    if not v2ray_url and re.search(CONFIG["v2ray_link_pattern"], u, re.I):
-                        v2ray_url = u
-                    elif not clash_url and re.search(CONFIG["clash_link_pattern"], u, re.I):
-                        clash_url = u
-                # 兼容旧的 dlink.host/1drv base64 形态
+                # 主策略：按位置判断（“订阅链接”行后的第一个 URL，按上下文客户端名分类）
+                v2ray_url, clash_url = extract_sub_urls_by_position(paste_content)
+                urls = re.findall(r'https?://[^\s\n]+', paste_content)
+                # 兜底：按 URL 特征匹配（config.yaml 里的 pattern）
+                if not clash_url or not v2ray_url:
+                    for u in urls:
+                        if not v2ray_url and re.search(CONFIG["v2ray_link_pattern"], u, re.I):
+                            v2ray_url = u
+                        elif not clash_url and re.search(CONFIG["clash_link_pattern"], u, re.I):
+                            clash_url = u
+                # 兼容更旧的 dlink.host/1drv base64 形态
                 if not clash_url or not v2ray_url:
                     for u in urls:
                         if "dlink.host" in u and "jpg" in u:
