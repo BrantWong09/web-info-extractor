@@ -5,11 +5,11 @@
 ## 工作流程
 
 1. 抓取指定 YouTube 频道的视频列表，找到最新的"稳定节点"视频
-2. 从视频简介提取 paste 下载地址，从视频字幕提取访问密码
+2. 从视频简介提取 paste 下载地址（简介里的长链接会被 YouTube 截断，截断时自动从作者评论补全完整地址），从视频字幕提取访问密码
 3. 用 Playwright 打开 paste 页面解密内容
 4. 从解密内容中按正则识别 v2ray 订阅直链和 Clash 订阅直链
 5. v2ray 直链写入 v2rayN 的 SQLite 订阅数据库（`SubItem` 表）
-6. Clash 直链下载 YAML 配置、过滤本地客户端不支持的加密节点后，写入 Clash Party 的 profiles 目录并重启客户端
+6. Clash 直链下载 YAML 配置、过滤本地客户端不支持的加密节点后，写入 Clash Party 的 profiles 目录（不重启客户端，下次启动或手动切换配置时生效）
 
 ## 使用方法
 

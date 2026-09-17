@@ -8,7 +8,7 @@ import tempfile
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from playwright.async_api import async_playwright
@@ -85,6 +85,65 @@ def get_video_page(video_id):
     return resp.text
 
 
+def get_comments_token(data):
+    """取 ytInitialData 里评论区首页的 continuation token"""
+    for panel in data.get("engagementPanels", []):
+        renderer = panel.get("engagementPanelSectionListRenderer", {})
+        if renderer.get("panelIdentifier") != "engagement-panel-comments-section":
+            continue
+        try:
+            items = renderer["content"]["sectionListRenderer"]["contents"][0]["itemSectionRenderer"]["contents"]
+            return items[0]["continuationItemRenderer"]["continuationEndpoint"]["continuationCommand"]["token"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return None
+
+
+def resolve_truncated_url(html, data, truncated_url):
+    """补全被 YouTube 截断的简介链接。
+
+    简介里的长链接只显示前一段加省略号（如 “…/?<paste id>#<密钥前 7 位>...”），
+    paste.to 拿到不完整的密钥会直接报 “mangled URL” 退出，连密码框都不弹。
+    作者会在评论区另贴一份完整地址，这里按 paste id 从评论区取回完整 URL。"""
+    id_match = re.search(r"[0-9a-f]{16}", truncated_url)
+    api_key = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+    token = get_comments_token(data)
+    if not (id_match and api_key and token):
+        return None
+
+    client_version = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
+    resp = requests.post(
+        f"https://www.youtube.com/youtubei/v1/next?key={api_key.group(1)}",
+        json={
+            "context": {"client": {
+                "clientName": "WEB",
+                "clientVersion": client_version.group(1) if client_version else "2.20250101.00.00",
+                "hl": "zh-CN", "gl": "US",
+            }},
+            "continuation": token,
+        },
+        headers={"Content-Type": "application/json", **HEADERS},
+        cookies=COOKIES, proxies=proxies, timeout=TIMEOUT,
+    )
+    resp.raise_for_status()
+
+    paste_id = id_match.group(0)
+    host = urlparse(truncated_url).netloc
+    candidates = []
+    for raw in re.findall(r"https?://[^\"'\\\s]+", resp.text):
+        url = unquote(raw)
+        if "youtube.com/redirect" in url:
+            # 评论里的链接是跳转形式，真正的地址在 q= 参数里
+            url = parse_qs(urlparse(url).query).get("q", [""])[0]
+        if paste_id in url and "..." not in url:
+            candidates.append(url)
+    # 优先取与简介地址同域名的，避免命中评论里的广告链接
+    for url in candidates:
+        if urlparse(url).netloc == host:
+            return url
+    return candidates[0] if candidates else None
+
+
 def get_description_and_download_url(video_id):
     html = get_video_page(video_id)
     data = extract_yt_data(html)
@@ -123,6 +182,11 @@ def get_description_and_download_url(video_id):
                 download_url = raw
         else:
             download_url = short_url
+    if download_url and download_url.endswith("..."):
+        full_url = resolve_truncated_url(html, data, download_url)
+        if full_url:
+            print(f"  简介地址被截断，已从评论区补全")
+            download_url = full_url
     return description, download_url
 
 
@@ -363,9 +427,7 @@ async def update_clash_party_sub(new_url):
     with open(CLASH_PARTY_PROFILE, "w", encoding="utf-8") as f:
         yaml.safe_dump(profile_config, f, allow_unicode=True, sort_keys=False)
     print(f"  已更新 profile.yaml (IProfileConfig)")
-
-    restart_clash()
-    print(f"  完成")
+    print(f"  完成（配置在下一次启动/手动切换配置时生效）")
 
 
 def download_and_filter(url):
@@ -393,21 +455,6 @@ def download_and_filter(url):
     else:
         print(f"  无需过滤，共 {after} 个节点")
     return cfg
-
-
-def restart_clash():
-    import subprocess, time
-    subprocess.run(["taskkill", "/F", "/IM", "Clash Party.exe"], capture_output=True)
-    subprocess.run(["taskkill", "/F", "/IM", "mihomo.exe"], capture_output=True)
-    time.sleep(3)
-    exe = CONFIG["clash_party_exe"]
-    if os.path.exists(exe):
-        # 用 os.startfile(ShellExecute) 分离启动：若用 Popen 直接启动，
-        # Clash 会挂到当前终端的控制台上，终端一关闭 Clash 就被连带杀掉
-        os.startfile(exe)
-    else:
-        subprocess.Popen(["cmd", "/c", "start", "", "Clash Party"], close_fds=True)
-    time.sleep(8)
 
 
 async def update_v2rayn_sub(new_url):

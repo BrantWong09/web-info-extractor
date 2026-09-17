@@ -18,6 +18,3 @@ v2rayn_db: "E:/<v2rayN 安装目录>/guiConfigs/guiNDB.db"
 
 # mihomo-party (Clash Party) 配置目录
 mihomo_party_dir: "C:/Users/<用户名>/AppData/Roaming/mihomo-party"
-
-# Clash Party 可执行文件路径（用于更新配置后重启）
-clash_party_exe: "D:/<Clash Party 安装目录>/Clash Party.exe"
