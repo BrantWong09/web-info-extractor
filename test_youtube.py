@@ -515,16 +515,31 @@ async def main_async():
             time.sleep(3)
 
     if transcript:
-        pwd = extract_password(transcript)
         print(f"\n视频文字 ({len(transcript)}字)")
-        print(f"密码: {pwd or '未提取到'}")
     else:
-        print("\n[字幕] 无法获取，使用缓存密码")
-        pwd = CONFIG.get("fallback_password")  # config.yaml 兜底密码
+        print("\n[字幕] 无法获取")
 
-    if pwd and dl_url:
-            print(f"\n正在用浏览器解密 paste.to...")
-            paste_content = await decrypt_paste(dl_url, pwd)
+    # 密码来源按可信度排序：简介 → 字幕 → 配置兜底。
+    # 作者会在视频里故意念错密码，把正确密码只写在简介里，所以简介优先，
+    # 解不开 paste 就换下一个候选，避免字幕里的假密码直接让流程失败。
+    candidates = []
+    for value in (
+        extract_password(desc or ""),
+        extract_password(transcript) if transcript else None,
+        CONFIG.get("fallback_password"),  # config.yaml 兜底密码
+    ):
+        if value and value not in candidates:
+            candidates.append(value)
+    print(f"密码候选: {', '.join(candidates) or '无'}")
+
+    if candidates and dl_url:
+            paste_content = None
+            for pwd in candidates:
+                print(f"\n正在用浏览器解密 paste.to（密码 {pwd}）...")
+                paste_content = await decrypt_paste(dl_url, pwd)
+                if paste_content:
+                    break
+                print(f"  密码 {pwd} 解不开，换下一个")
             if paste_content:
                 print(f"\n=== Paste 内容 ===")
                 print(paste_content)
@@ -570,7 +585,7 @@ async def main_async():
             else:
                 print("解密 paste 失败")
     else:
-        print("未获取到视频字幕")
+        print("没拿到可用密码或下载地址，跳过解密")
 
 
 if __name__ == "__main__":
