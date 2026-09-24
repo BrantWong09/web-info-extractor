@@ -1,7 +1,9 @@
 # 复制本文件为 config.yaml 并填入你自己的值；config.yaml 已被 .gitignore 排除，不会提交到仓库
 
-# YouTube 频道地址
-channel_url: "https://www.youtube.com/@YOUR_CHANNEL"
+# YouTube 频道地址（可配置多个；脚本会抓取全部频道，按视频标题里的日期取最大的那个）
+channel_urls:
+  - "https://www.youtube.com/@YOUR_CHANNEL"
+  - "https://www.youtube.com/@YOUR_BACKUP_CHANNEL"
 
 # 从视频字幕提取密码失败时的兜底密码（可为空字符串）
 fallback_password: "0000"

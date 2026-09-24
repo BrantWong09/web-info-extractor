@@ -5,10 +5,12 @@ import sqlite3
 import shutil
 import os
 import tempfile
+import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from urllib.parse import parse_qs, urlparse, unquote
+from html import unescape
+from urllib.parse import urlparse, unquote
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from playwright.async_api import async_playwright
@@ -29,6 +31,28 @@ DATE_PATTERN = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "zh-CN,zh;q=0.9"}
 COOKIES = {"CONSENT": "YES+cb.20220419-16-p0.en+FX+{}", "SOCS": "CAI"}
 TIMEOUT = 30
+RETRY_TIMES = 3
+
+
+def http_get(url, **kwargs):
+    """带重试的 GET。
+
+    走本地代理抓 YouTube 经常传输中途断连（ChunkedEncodingError /
+    ConnectionResetError），单次失败就让整轮退出太脆，这里退避重试。"""
+    last_error = None
+    for attempt in range(RETRY_TIMES):
+        try:
+            resp = requests.get(url, headers=HEADERS, cookies=COOKIES,
+                                proxies=proxies, timeout=TIMEOUT, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_error = e
+            if attempt < RETRY_TIMES - 1:
+                wait = 2 * (attempt + 1)
+                print(f"  请求失败({type(e).__name__}: {e})，{wait}s 后重试: {url}")
+                time.sleep(wait)
+    raise last_error
 
 
 def extract_yt_data(html):
@@ -48,23 +72,98 @@ def extract_yt_data(html):
     return None
 
 
+def get_channel_urls():
+    """读取要抓取的频道列表。优先用 channel_urls（列表），兼容旧的单值 channel_url。"""
+    value = CONFIG.get("channel_urls") or CONFIG.get("channel_url")
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    urls = []
+    for u in value:
+        u = (u or "").strip().rstrip("/")
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
 def get_video_list(channel_url):
-    resp = requests.get(channel_url + "/videos", headers=HEADERS, cookies=COOKIES, proxies=proxies, timeout=TIMEOUT)
-    resp.raise_for_status()
-    data = extract_yt_data(resp.text)
-    tabs = data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
-    videos = []
-    for tab in tabs:
-        contents = tab.get("tabRenderer", {}).get("content", {}).get("richGridRenderer", {}).get("contents", [])
-        for item in contents:
-            lockup = item.get("richItemRenderer", {}).get("content", {}).get("lockupViewModel", {})
-            if not lockup:
-                continue
-            vid = lockup.get("contentId", "")
-            title_obj = lockup.get("metadata", {}).get("lockupMetadataViewModel", {}).get("title", {})
-            title = title_obj.get("content", "") if isinstance(title_obj, dict) else str(title_obj)
-            if vid and title:
+    """抓频道视频列表，返回 [{video_id, title}]。频道页解析不了时退回 RSS。"""
+    url = channel_url + "/videos"
+    html = ""
+    try:
+        resp = http_get(url)
+        html = resp.text
+        data = extract_yt_data(html)
+        if not data:
+            # YouTube 偶尔会返回同意页 / 机器人校验页（几十 KB，没有 ytInitialData）
+            raise ValueError(f"频道页没有 ytInitialData（{len(html)} 字节，可能被返回了同意页或校验页）")
+        videos = parse_channel_videos(data)
+        if not videos:
+            raise ValueError("频道页里没有解析到视频")
+        return videos
+    except Exception as e:
+        videos = parse_rss_videos(channel_url, html)
+        if videos:
+            print(f"  频道页解析失败（{e}），改用 RSS 取最近 {len(videos)} 个视频")
+            return videos
+        raise
+
+
+def parse_channel_videos(data):
+    """从频道页 ytInitialData 里取视频列表（按展示顺序）。
+
+    不写死 contents→twoColumnBrowseResultsRenderer→tabs→richGridRenderer 这条路径，
+    直接递归找 lockupViewModel（新版）或 gridVideoRenderer（老版），
+    这样 YouTube 调整层级时不会整段失效。"""
+    for key in ("lockupViewModel", "gridVideoRenderer"):
+        videos = []
+        seen = set()
+        for item in _find_all(data, key):
+            if key == "lockupViewModel":
+                vid = item.get("contentId", "")
+                title_obj = item.get("metadata", {}).get("lockupMetadataViewModel", {}).get("title", {})
+                title = title_obj.get("content", "") if isinstance(title_obj, dict) else str(title_obj)
+            else:
+                vid = item.get("videoId", "")
+                title_obj = item.get("title", {})
+                if isinstance(title_obj, dict):
+                    title = title_obj.get("simpleText") or "".join(
+                        r.get("text", "") for r in title_obj.get("runs", []) or [])
+                else:
+                    title = str(title_obj)
+            if vid and title and vid not in seen:
+                seen.add(vid)
                 videos.append({"video_id": vid, "title": title})
+        if videos:
+            return videos
+    return []
+
+
+def parse_rss_videos(channel_url, html=""):
+    """RSS 兜底：频道页抓不到时用上传视频 feed（只有最近 15 条）。
+
+    标题里的日期格式和网页一致，所以不影响 find_latest_stable_node。"""
+    channel_id = re.search(r'"externalId":"(UC[\w-]{22})"', html or "")
+    if not channel_id:
+        try:
+            page = http_get(channel_url)
+            channel_id = re.search(r'"externalId":"(UC[\w-]{22})"', page.text)
+        except Exception:
+            channel_id = None
+    if not channel_id:
+        return []
+    try:
+        resp = http_get(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id.group(1)}")
+    except Exception as e:
+        print(f"  RSS 兜底也失败: {e}")
+        return []
+    videos = []
+    for entry in re.findall(r"<entry>(.*?)</entry>", resp.text, re.S):
+        vid = re.search(r"<yt:videoId>([^<]+)</yt:videoId>", entry)
+        title = re.search(r"<title>(.*?)</title>", entry, re.S)
+        if vid and title:
+            videos.append({"video_id": vid.group(1).strip(), "title": unescape(title.group(1)).strip()})
     return videos
 
 
@@ -80,9 +179,7 @@ def find_latest_stable_node(videos):
 
 def get_video_page(video_id):
     url = f"https://www.youtube.com/watch?v={video_id}"
-    resp = requests.get(url, headers=HEADERS, cookies=COOKIES, proxies=proxies, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp.text
+    return http_get(url).text
 
 
 def get_comments_token(data):
@@ -99,44 +196,171 @@ def get_comments_token(data):
     return None
 
 
-def resolve_truncated_url(html, data, truncated_url):
+def unwrap_redirect_url(url):
+    """YouTube 的跳转链接（.../redirect?...&q=<真实地址>）取回真实地址。
+
+    用正则而不是 parse_qs：q= 里的地址可能带 #（如 paste.to 的密钥），
+    整体是 %23 编码的，按字符串截取再 unquote 更稳。"""
+    if "youtube.com/redirect" in url:
+        m = re.search(r"[?&]q=([^&]+)", url)
+        if m:
+            return unquote(m.group(1))
+    return url
+
+
+def _find_all(node, key):
+    """递归收集 JSON 里所有名为 key 的节点（按文档顺序）"""
+    found = []
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if key in cur and isinstance(cur[key], dict):
+                found.append(cur[key])
+            stack.extend(reversed(list(cur.values())))
+        elif isinstance(cur, list):
+            stack.extend(reversed(cur))
+    return found
+
+
+def parse_comments(payload):
+    """把 youtubei/v1/next 的评论响应解析成评论列表，每项：
+    {author, is_owner, text, urls, runs}，runs 是 {文本起始位置: 完整地址}。
+    is_owner 即频道拥有者（作者本人）的评论。"""
+    entities = {p.get("key"): p for p in _find_all(payload, "commentEntityPayload")}
+
+    comments = []
+    # 按评论区的展示顺序取，作者置顶的评论通常在最前面
+    for thread in _find_all(payload, "commentThreadRenderer"):
+        key = thread.get("commentViewModel", {}).get("commentViewModel", {}).get("commentKey")
+        entity = entities.pop(key, None)
+        if entity:
+            comments.append(_comment_from_entity(entity))
+    comments.extend(_comment_from_entity(p) for p in entities.values())
+
+    if not comments:
+        # 老版结构兜底
+        comments = [_comment_from_legacy_renderer(r) for r in _find_all(payload, "commentRenderer")]
+    return [c for c in comments if c["text"] or c["urls"]]
+
+
+def _comment_from_entity(payload):
+    author = payload.get("author", {}) or {}
+    content = (payload.get("properties", {}) or {}).get("content", {}) or {}
+    return _build_comment(author.get("displayName", ""), bool(author.get("isCreator")), content)
+
+
+def _comment_from_legacy_renderer(renderer):
+    author = (renderer.get("authorText", {}) or {}).get("simpleText", "") or ""
+    return _build_comment(author, bool(renderer.get("authorIsChannelOwner")), renderer.get("contentText", {}) or {})
+
+
+def _build_comment(author, is_owner, content):
+    text = content.get("content") or content.get("simpleText") or \
+        "".join(r.get("text", "") for r in content.get("runs", []) or [])
+    runs = {}
+    for cmd in content.get("commandRuns", []) or []:
+        nav = cmd.get("onTap", {}).get("innertubeCommand", {}) or {}
+        raw = (nav.get("urlEndpoint", {}) or {}).get("url") or \
+            (nav.get("commandMetadata", {}) or {}).get("webCommandMetadata", {}).get("url", "")
+        if raw:
+            runs[cmd.get("startIndex", 0)] = unwrap_redirect_url(raw.replace("\\u0026", "&"))
+    urls = list(runs.values())
+    for u in re.findall(r"https?://[^\s\u3000\"'<>]+", text):
+        u = u.rstrip("，。、）)】]")
+        if u not in urls:
+            urls.append(u)
+    return {"author": author, "is_owner": is_owner, "text": text, "urls": urls, "runs": runs}
+
+
+def get_comments(html, data):
+    """抓取视频评论首页，返回评论列表。
+
+    作者会把节点下载地址放在自己的评论区留言里（简介只写“节点在评论区”），
+    所以评论是除简介外的第二个地址来源。"""
+    token = get_comments_token(data)
+    api_key = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+    if not (token and api_key):
+        return []
+
+    client_version = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
+    last_error = None
+    for attempt in range(RETRY_TIMES):
+        try:
+            resp = requests.post(
+                f"https://www.youtube.com/youtubei/v1/next?key={api_key.group(1)}",
+                json={
+                    "context": {"client": {
+                        "clientName": "WEB",
+                        "clientVersion": client_version.group(1) if client_version else "2.20250101.00.00",
+                        "hl": "zh-CN", "gl": "US",
+                    }},
+                    "continuation": token,
+                },
+                headers={"Content-Type": "application/json", **HEADERS},
+                cookies=COOKIES, proxies=proxies, timeout=TIMEOUT,
+            )
+            resp.raise_for_status()
+            return parse_comments(resp.json())
+        except Exception as e:
+            last_error = e
+            if attempt < RETRY_TIMES - 1:
+                time.sleep(2 * (attempt + 1))
+    print(f"  评论区抓取失败: {last_error}")
+    return []
+
+
+def extract_labeled_url(text, url_map):
+    """按“下载地址：”标签取后面的链接，优先用 url_map 里该位置的完整地址"""
+    m = re.search(r"下载地址[：:]\s*(\S+)", text or "")
+    if not m:
+        return None
+    pos = m.start(1)
+    return url_map.get(pos) or m.group(1).rstrip("，。、）)】]")
+
+
+def find_download_url_in_owner_comments(comments, desc_url=None):
+    """从频道拥有者的评论里取下载地址，返回 (地址, 该评论原文)。
+
+    作者评论里还挂着机场广告、Telegram 群等一堆链接，所以取法必须保守：
+    先认“下载地址：”标签；没标签时退回和简介同域名的链接；再退回带 paste id
+    （16 位十六进制，如 paste.to）的链接。"""
+    owners = [c for c in comments if c["is_owner"]]
+    for c in owners:
+        url = extract_labeled_url(c["text"], c["runs"])
+        if url:
+            return url, c["text"]
+    if desc_url:
+        host = urlparse(desc_url).netloc
+        for c in owners:
+            for u in c["urls"]:
+                if host and urlparse(u).netloc == host:
+                    return u, c["text"]
+    for c in owners:
+        for u in c["urls"]:
+            if re.search(r"[0-9a-f]{16}", u):
+                return u, c["text"]
+    return None, None
+
+
+def resolve_truncated_url(html, data, truncated_url, comments=None):
     """补全被 YouTube 截断的简介链接。
 
     简介里的长链接只显示前一段加省略号（如 “…/?<paste id>#<密钥前 7 位>...”），
     paste.to 拿到不完整的密钥会直接报 “mangled URL” 退出，连密码框都不弹。
     作者会在评论区另贴一份完整地址，这里按 paste id 从评论区取回完整 URL。"""
     id_match = re.search(r"[0-9a-f]{16}", truncated_url)
-    api_key = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
-    token = get_comments_token(data)
-    if not (id_match and api_key and token):
+    if not id_match:
         return None
-
-    client_version = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
-    resp = requests.post(
-        f"https://www.youtube.com/youtubei/v1/next?key={api_key.group(1)}",
-        json={
-            "context": {"client": {
-                "clientName": "WEB",
-                "clientVersion": client_version.group(1) if client_version else "2.20250101.00.00",
-                "hl": "zh-CN", "gl": "US",
-            }},
-            "continuation": token,
-        },
-        headers={"Content-Type": "application/json", **HEADERS},
-        cookies=COOKIES, proxies=proxies, timeout=TIMEOUT,
-    )
-    resp.raise_for_status()
-
     paste_id = id_match.group(0)
     host = urlparse(truncated_url).netloc
+    if comments is None:
+        comments = get_comments(html, data)
     candidates = []
-    for raw in re.findall(r"https?://[^\"'\\\s]+", resp.text):
-        url = unquote(raw)
-        if "youtube.com/redirect" in url:
-            # 评论里的链接是跳转形式，真正的地址在 q= 参数里
-            url = parse_qs(urlparse(url).query).get("q", [""])[0]
-        if paste_id in url and "..." not in url:
-            candidates.append(url)
+    for c in comments:
+        for u in c["urls"]:
+            if paste_id in u and "..." not in u:
+                candidates.append(u)
     # 优先取与简介地址同域名的，避免命中评论里的广告链接
     for url in candidates:
         if urlparse(url).netloc == host:
@@ -145,10 +369,14 @@ def resolve_truncated_url(html, data, truncated_url):
 
 
 def get_description_and_download_url(video_id):
+    """返回 (简介原文, 下载地址, 作者评论原文)。
+
+    地址优先取简介里的“下载地址：”标签；简介里没有（现在作者常常只写
+    “节点在我的评论区”）时，从频道拥有者的评论里取。"""
     html = get_video_page(video_id)
     data = extract_yt_data(html)
     if not data:
-        return "", None
+        return "", None, ""
     description = ""
     url_map = {}
     for panel in data.get("engagementPanels", []):
@@ -159,35 +387,29 @@ def get_description_and_download_url(video_id):
                 attr = renderer.get("attributedDescriptionBodyText", {})
                 description = attr.get("content", "")
                 for cmd in attr.get("commandRuns", []):
-                    start_idx = cmd.get("startIndex", 0)
-                    length = cmd.get("length", 0)
                     nav = cmd.get("onTap", {}).get("innertubeCommand", {})
                     url_ep = nav.get("commandMetadata", {}).get("webCommandMetadata", {}).get("url", "")
                     if url_ep and url_ep.startswith("http"):
-                        url_map[start_idx] = {
-                            "display": description[start_idx:start_idx + length],
-                            "full_url": url_ep.replace("\\u0026", "&"),
-                        }
-    download_url = None
-    match = re.search(r"下载地址[：:]\s*(\S+)", description)
-    if match:
-        short_url = match.group(1)
-        pos = match.start(1)
-        if pos in url_map:
-            raw = url_map[pos]["full_url"]
-            if "youtube.com/redirect" in raw:
-                q = parse_qs(urlparse(raw).query).get("q", [raw])[0]
-                download_url = q
-            else:
-                download_url = raw
-        else:
-            download_url = short_url
-    if download_url and download_url.endswith("..."):
-        full_url = resolve_truncated_url(html, data, download_url)
-        if full_url:
-            print(f"  简介地址被截断，已从评论区补全")
-            download_url = full_url
-    return description, download_url
+                        url_map[cmd.get("startIndex", 0)] = unwrap_redirect_url(url_ep.replace("\\u0026", "&"))
+
+    download_url = extract_labeled_url(description, url_map)
+    owner_text = ""
+    # 简介里没写地址（或地址被截断补不全）时，看作者评论
+    if not download_url or download_url.endswith("..."):
+        comments = get_comments(html, data)
+        owner_text = "\n".join(c["text"] for c in comments if c["is_owner"])
+        if download_url and download_url.endswith("..."):
+            full_url = resolve_truncated_url(html, data, download_url, comments)
+            if full_url:
+                print(f"  简介地址被截断，已从作者评论补全")
+                download_url = full_url
+        if not download_url or download_url.endswith("..."):
+            comment_url, comment_text = find_download_url_in_owner_comments(comments, download_url)
+            if comment_url:
+                print(f"  地址取自作者评论")
+                download_url = comment_url
+                owner_text = comment_text
+    return description, download_url, owner_text
 
 
 async def get_transcript_playwright(video_id):
@@ -278,12 +500,11 @@ def get_transcript(video_id):
             if player_resp.status_code == 200:
                 tracks = player_resp.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
                 if tracks:
-                    tr_resp = requests.get(tracks[0].get("baseUrl", ""), headers=HEADERS, cookies=COOKIES, proxies=proxies, timeout=TIMEOUT)
-                    if tr_resp.status_code == 200:
-                        texts = re.findall(r"<p[^>]*>(.*?)</p>", tr_resp.text)
-                        result = " ".join(t.strip() for t in texts if t.strip())
-                        if result:
-                            return result
+                    tr_resp = http_get(tracks[0].get("baseUrl", ""))
+                    texts = re.findall(r"<p[^>]*>(.*?)</p>", tr_resp.text)
+                    result = " ".join(t.strip() for t in texts if t.strip())
+                    if result:
+                        return result
     except Exception:
         pass
 
@@ -433,8 +654,7 @@ async def update_clash_party_sub(new_url):
 def download_and_filter(url):
     import yaml
     # raw.githubusercontent.com 必须走本地代理才能访问
-    resp = requests.get(url, timeout=30, verify=False, proxies=proxies)
-    resp.raise_for_status()
+    resp = http_get(url, timeout=60, verify=False)
     cfg = yaml.safe_load(resp.content.decode("utf-8"))
 
     before = len(cfg.get("proxies", []))
@@ -484,21 +704,40 @@ async def update_v2rayn_sub(new_url):
 
 
 async def main_async():
-    channel = CONFIG["channel_url"]
-    videos = get_video_list(channel)
-    print(f"共获取 {len(videos)} 个视频")
-
-    result = find_latest_stable_node(videos)
-    if not result:
-        print("未找到符合条件的视频")
+    channels = get_channel_urls()
+    if not channels:
+        print("config.yaml 里没有配置频道（channel_urls / channel_url）")
         return
 
+    # 多个频道都可能是最新来源（旧频道偶尔仍在更新），逐个抓取后按标题里的日期取最大值
+    candidates = []
+    for channel in channels:
+        try:
+            videos = get_video_list(channel)
+        except Exception as e:
+            print(f"[{channel}] 获取视频列表失败: {e}")
+            continue
+        print(f"[{channel}] 共获取 {len(videos)} 个视频")
+        latest = find_latest_stable_node(videos)
+        if latest:
+            latest["channel"] = channel
+            candidates.append(latest)
+            print(f"  最新稳定节点: {latest['date'].strftime('%Y-%m-%d')} {latest['title']}")
+        else:
+            print(f"  未找到符合条件的视频")
+
+    if not candidates:
+        print("所有频道都没有符合条件的视频")
+        return
+
+    result = max(candidates, key=lambda x: x["date"])
     video_id = result["video_id"]
     print(f"\n最新视频: {result['date'].strftime('%Y-%m-%d')}")
+    print(f"  来源频道: {result['channel']}")
     print(f"  标题: {result['title']}")
     print(f"  链接: https://www.youtube.com/watch?v={video_id}")
 
-    desc, dl_url = get_description_and_download_url(video_id)
+    desc, dl_url, owner_text = get_description_and_download_url(video_id)
     print(f"\n下载地址: {dl_url or '未找到'}")
 
     transcript = None
@@ -519,12 +758,13 @@ async def main_async():
     else:
         print("\n[字幕] 无法获取")
 
-    # 密码来源按可信度排序：简介 → 字幕 → 配置兜底。
+    # 密码来源按可信度排序：简介 → 作者评论 → 字幕 → 配置兜底。
     # 作者会在视频里故意念错密码，把正确密码只写在简介里，所以简介优先，
     # 解不开 paste 就换下一个候选，避免字幕里的假密码直接让流程失败。
     candidates = []
     for value in (
         extract_password(desc or ""),
+        extract_password(owner_text or ""),
         extract_password(transcript) if transcript else None,
         CONFIG.get("fallback_password"),  # config.yaml 兜底密码
     ):
